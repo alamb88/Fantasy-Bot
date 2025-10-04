@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+openai
+youtube-transcript-api
+faiss-cpu
+tiktoken
