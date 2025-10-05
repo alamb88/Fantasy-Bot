@@ -1,11 +1,15 @@
 import os
+import re
 import json
 from dataclasses import dataclass, asdict
-from typing import List
+from typing import List, Optional
 
 import faiss
 import numpy as np
 import tiktoken
+import requests
+import yt_dlp
+
 from openai import OpenAI
 from urllib.parse import urlparse, parse_qs
 from youtube_transcript_api import (
@@ -30,6 +34,105 @@ class Chunk:
     text: str
 
 
+# ----------------------- helpers -----------------------
+
+def _extract_video_id(url: str) -> str:
+    q = parse_qs(urlparse(url).query).get("v")
+    if q and len(q) > 0:
+        return q[0]
+    # fallback for youtu.be/<id> or other forms
+    path = urlparse(url).path.strip("/")
+    return path.split("/")[-1] if path else url
+
+_VTT_TS = re.compile(r"^\d{1,2}:\d{2}:\d{2}\.\d{3}\s-->\s\d{1,2}:\d{2}:\d{2}\.\d{3}")
+_SRT_TS = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3}\s-->\s\d{2}:\d{2}:\d{2},\d{3}")
+
+def _vtt_srt_to_text(raw: str) -> str:
+    lines = []
+    for line in raw.splitlines():
+        l = line.strip()
+        if not l:
+            continue
+        if l.isdigit():
+            # srt cue index
+            continue
+        if _VTT_TS.match(l) or _SRT_TS.match(l):
+            continue
+        if l.upper().startswith("WEBVTT"):
+            continue
+        # remove simple tags (italics, font)
+        l = re.sub(r"</?[^>]+>", "", l)
+        lines.append(l)
+    # collapse duplicate captions
+    text = " ".join(lines)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def _fetch_transcript_via_transcript_api(video_id: str) -> Optional[str]:
+    # Try manual English
+    try:
+        srt = YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-US", "en-GB"])
+        return " ".join([x.get("text", "") for x in srt if x.get("text")]).strip()
+    except (NoTranscriptFound, TranscriptsDisabled, Exception):
+        pass
+    # Fallback: auto-generated English
+    try:
+        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+        gen = transcripts.find_generated_transcript(["en", "en-US", "en-GB"])
+        srt = gen.fetch()
+        return " ".join([x.get("text", "") for x in srt if x.get("text")]).strip()
+    except Exception:
+        return None
+
+def _fetch_transcript_via_ytdlp(video_url: str) -> Optional[str]:
+    """
+    Use yt-dlp to get subtitle URLs (manual or automatic) and download the file.
+    """
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": False,  # we need full info (not flat playlist entries)
+        # do NOT write files; we’ll fetch the subtitle URL ourselves
+        "writesubtitles": False,
+        "writeautomaticsub": False,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+    except Exception:
+        return None
+
+    # Try manual subtitles first
+    sub_map = info.get("subtitles") or {}
+    auto_map = info.get("automatic_captions") or {}
+
+    def pick_url(track_map: dict) -> Optional[str]:
+        # Prefer English keys; fall back to any
+        for key in ["en", "en-US", "en-GB", "a.en", "en-uk", "en-us"]:
+            if key in track_map and track_map[key]:
+                # track is list of formats, pick the first URL
+                return track_map[key][0].get("url")
+        # any language as last resort
+        for _, lst in track_map.items():
+            if lst and lst[0].get("url"):
+                return lst[0]["url"]
+        return None
+
+    url = pick_url(sub_map) or pick_url(auto_map)
+    if not url:
+        return None
+
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        text = _vtt_srt_to_text(r.text)
+        return text if text else None
+    except Exception:
+        return None
+
+
+# ----------------------- main index -----------------------
+
 class VideoIndex:
     def __init__(self):
         os.makedirs(DATA_DIR, exist_ok=True)
@@ -46,37 +149,23 @@ class VideoIndex:
     # ---------- Ingest one video ----------
     def add_video(self, url: str) -> int:
         """
-        Fetch transcript (manual or auto), chunk, embed, and add to index.
+        Fetch transcript (Transcript API first, yt-dlp fallback), chunk, embed, and add to index.
         Returns number of chunks added for this video.
         """
-        vid = parse_qs(urlparse(url).query).get("v", [url.split("/")[-1]])[0]
+        vid = _extract_video_id(url)
 
-        # Try manual English transcript first
-        srt = None
-        try:
-            srt = YouTubeTranscriptApi.get_transcript(vid, languages=["en", "en-US", "en-GB"])
-        except (NoTranscriptFound, TranscriptsDisabled):
-            srt = None
+        # 1) Normal API path
+        full_text = _fetch_transcript_via_transcript_api(vid)
 
-        # Fallback: auto-generated English transcript
-        if srt is None:
-            try:
-                transcripts = YouTubeTranscriptApi.list_transcripts(vid)
-                gen = transcripts.find_generated_transcript(["en", "en-US", "en-GB"])
-                srt = gen.fetch()
-            except Exception:
-                srt = None
-
-        if not srt:
-            print(f"[skip] No transcript available for {url}")
-            return 0
-
-        full_text = " ".join([x.get("text", "") for x in srt if x.get("text")]).strip()
+        # 2) Fallback via yt-dlp subtitle URL (auto captions)
         if not full_text:
-            print(f"[skip] Empty transcript for {url}")
+            full_text = _fetch_transcript_via_ytdlp(url)
+
+        if not full_text:
+            print(f"[skip] No transcript available (API/yt-dlp) for {url}")
             return 0
 
-        # Simple chunking by characters (safe & fast)
+        # Simple chunking (character-based)
         chunk_size = 1500
         chunks = [full_text[i:i + chunk_size] for i in range(0, len(full_text), chunk_size)]
         if not chunks:
@@ -127,8 +216,8 @@ class VideoIndex:
 
 
 SYSTEM_PROMPT = """You are an NBA fantasy assistant for 9-category leagues.
-Base your answer on the provided snippets; keep it concise and practical.
-Cite numbered sources like [1], [2] including the video URLs.
+Base your answer on the provided snippets; be concise and practical.
+Cite numbered sources like [1], [2] with the video URLs.
 """
 
 def answer(query: str, hits: List[Chunk]) -> str:
@@ -146,3 +235,4 @@ def answer(query: str, hits: List[Chunk]) -> str:
         ],
     )
     return resp.choices[0].message.content
+
