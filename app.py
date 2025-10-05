@@ -1,5 +1,9 @@
 import os
-from fastapi import FastAPI, Query, Header, HTTPException
+import json
+import time
+import threading
+from typing import Set
+from fastapi import FastAPI, Query, Header, HTTPException, BackgroundTasks
 from fastapi.responses import PlainTextResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
@@ -77,6 +81,36 @@ def _passes_filters(item: dict, min_duration: int, include_kw: list[str], exclud
         return False
     return True
 
+# --- Full channel traversal (large playlists) ---
+def fetch_channel_items_all(channel: str, max_items: int = 5000) -> list[dict]:
+    """
+    Traverse a channel/playlist and return up to max_items entries with id,title,duration,url.
+    Using extract_flat lets yt-dlp fetch long playlists without downloading media.
+    """
+    channel_url = f"https://www.youtube.com/{channel}/videos" if channel.startswith("@") else channel
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": True,
+        "playlistend": max_items,    # cap to avoid endless crawl
+        "noplaylist": False,
+    }
+    items: list[dict] = []
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(channel_url, download=False)
+        for e in (info.get("entries") or []):
+            vid = e.get("id")
+            title = e.get("title") or ""
+            duration = e.get("duration")
+            if vid:
+                items.append({
+                    "id": vid,
+                    "url": f"https://www.youtube.com/watch?v={vid}",
+                    "title": title,
+                    "duration": duration if isinstance(duration, (int, float)) else None
+                })
+    return items
+
 # ================= Index init =================
 
 vi = VideoIndex()
@@ -84,6 +118,10 @@ try:
     vi.load()
 except Exception as e:
     print("Index load skipped:", repr(e))
+
+# de-dupe helper for full-channel ingest
+def _seen_ids_from_meta() -> Set[str]:
+    return set(m.video_id for m in vi.meta)
 
 # ---- Auto-ingest on startup if index is empty (no Volumes) ----
 AUTO_INGEST = os.getenv("AUTO_INGEST", "0") == "1"
@@ -286,6 +324,144 @@ def admin_ingest_one(
     except Exception as e:
         return f"Error: {repr(e)}"
 
+# ---------------- Full-Channel Ingest (Background) ----------------
+
+PROGRESS_PATH = os.path.join("data", "ingest_progress.json")
+_ingest_lock = threading.Lock()
+_ingest_running = False
+_progress = {
+    "running": False,
+    "started_at": 0,
+    "finished_at": 0,
+    "added_videos": 0,
+    "added_chunks": 0,
+    "skipped": 0,
+    "errors": 0,
+    "last": "",
+    "total_candidates": 0,
+    "done": False,
+}
+
+def _progress_save():
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open(PROGRESS_PATH, "w") as f:
+            json.dump(_progress, f, indent=2)
+    except Exception:
+        pass
+
+def _progress_reset():
+    global _progress
+    _progress = {
+        "running": True,
+        "started_at": int(time.time()),
+        "finished_at": 0,
+        "added_videos": 0,
+        "added_chunks": 0,
+        "skipped": 0,
+        "errors": 0,
+        "last": "",
+        "total_candidates": 0,
+        "done": False,
+    }
+    _progress_save()
+
+def _ingest_channel_worker(channel: str, max_items: int, min_duration: int,
+                           include: list[str], exclude: list[str]):
+    global _ingest_running
+    try:
+        items = fetch_channel_items_all(channel, max_items=max_items)
+        _progress["total_candidates"] = len(items)
+        _progress_save()
+
+        seen = _seen_ids_from_meta()
+        for it in items:
+            try:
+                _progress["last"] = it.get("url", "")
+                title = (it.get("title") or "").lower()
+                dur = it.get("duration") or 0
+                vid = it.get("id")
+                url = it.get("url")
+
+                # Filters
+                if dur and dur < min_duration:
+                    _progress["skipped"] += 1; _progress_save(); continue
+                if include and not any(kw in title for kw in include):
+                    _progress["skipped"] += 1; _progress_save(); continue
+                if exclude and any(kw in title for kw in exclude):
+                    _progress["skipped"] += 1; _progress_save(); continue
+                if vid in seen:
+                    _progress["skipped"] += 1; _progress_save(); continue
+
+                # Ingest
+                added = vi.add_video(url)
+                if added > 0:
+                    _progress["added_videos"] += 1
+                    _progress["added_chunks"] += added
+                    seen.add(vid)
+                    # periodic save
+                    if (_progress["added_videos"] % 5) == 0:
+                        vi.save()
+                else:
+                    _progress["skipped"] += 1
+                _progress_save()
+
+            except Exception:
+                _progress["errors"] += 1
+                _progress_save()
+
+        # final save
+        if vi.index is not None and len(vi.meta) > 0:
+            vi.save()
+
+    finally:
+        _progress["done"] = True
+        _progress["running"] = False
+        _progress["finished_at"] = int(time.time())
+        _progress_save()
+        with _ingest_lock:
+            _ingest_running = False
+
+@app.post("/admin/ingest_channel_full", response_class=PlainTextResponse)
+def admin_ingest_channel_full(
+    background_tasks: BackgroundTasks,
+    x_admin_token: str = Header(default=""),
+    channel: str = Query("@LockedOnFantasyBasketball"),
+    max_items: int = Query(5000, ge=1, le=20000),
+    min_duration: int = Query(600, ge=0),  # 10+ minutes by default
+    include: str = Query("tier,sleeper,bust,punt,rank,draft"),
+    exclude: str = Query("short,stream,live,clip"),
+):
+    """
+    Kick off a long-running, full-channel ingestion in the background.
+    Returns immediately; poll /admin/ingest_progress for status.
+    """
+    _require_admin(x_admin_token)
+
+    include_kw = [s.strip().lower() for s in include.split(",") if s.strip()]
+    exclude_kw = [s.strip().lower() for s in exclude.split(",") if s.strip()]
+
+    global _ingest_running
+    with _ingest_lock:
+        if _ingest_running:
+            return "Ingest already running. Check /admin/ingest_progress."
+        _ingest_running = True
+        _progress_reset()
+        background_tasks.add_task(_ingest_channel_worker, channel, max_items, min_duration, include_kw, exclude_kw)
+
+    return "Full-channel ingest started. Check /admin/ingest_progress."
+
+@app.get("/admin/ingest_progress")
+def admin_ingest_progress(x_admin_token: str = Header(default="")):
+    _require_admin(x_admin_token)
+    # Try to return latest saved snapshot if present
+    try:
+        if os.path.exists(PROGRESS_PATH):
+            return JSONResponse(json.load(open(PROGRESS_PATH)))
+    except Exception:
+        pass
+    return JSONResponse(_progress)
+
 # ================= Yahoo Auth & Data =================
 
 @app.get("/auth/yahoo/login")
@@ -348,5 +524,4 @@ def yahoo_cache_read():
     p = os.path.join("data", "yahoo_cache.json")
     if not os.path.exists(p):
         return PlainTextResponse("No Yahoo cache yet. Run /auth/yahoo/login then /admin/yahoo/cache_league.", status_code=404)
-    import json
     return JSONResponse(json.load(open(p)))
