@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import tempfile
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 
@@ -26,6 +27,9 @@ YAHOO_CACHE = os.path.join(DATA_DIR, "yahoo_cache.json")
 
 client = OpenAI()  # Requires OPENAI_API_KEY env var
 enc = tiktoken.get_encoding("cl100k_base")
+
+# Deepgram API key (optional, used if present)
+DG_KEY = os.getenv("DEEPGRAM_API_KEY", None)
 
 
 @dataclass
@@ -85,7 +89,7 @@ def _fetch_transcript_via_transcript_api(video_id: str) -> Optional[str]:
     except Exception:
         return None
 
-def _fetch_transcript_via_ytdlp(video_url: str) -> Optional[str]:
+def _fetch_transcript_via_ytdlp(video_url: str, timeout: int = 20) -> Optional[str]:
     """
     Use yt-dlp to get subtitle URLs (manual or automatic) and download the file.
     """
@@ -93,8 +97,11 @@ def _fetch_transcript_via_ytdlp(video_url: str) -> Optional[str]:
         "quiet": True,
         "skip_download": True,
         "extract_flat": False,  # need full info
-        "writesubtitles": False,
-        "writeautomaticsub": False,
+        "retries": 5,
+        "file_access_retries": 5,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -121,12 +128,94 @@ def _fetch_transcript_via_ytdlp(video_url: str) -> Optional[str]:
         return None
 
     try:
-        r = requests.get(url, timeout=20)
+        r = requests.get(url, timeout=timeout)
         r.raise_for_status()
         text = _vtt_srt_to_text(r.text)
         return text if text else None
     except Exception:
         return None
+
+def _transcribe_with_deepgram(video_url: str) -> Optional[str]:
+    """
+    Deepgram fallback: transcribe directly by YouTube URL (no local download).
+    Requires DEEPGRAM_API_KEY.
+    """
+    if not DG_KEY:
+        return None
+    try:
+        r = requests.post(
+            "https://api.deepgram.com/v1/listen",
+            headers={"Authorization": f"Token {DG_KEY}"},
+            json={
+                "url": video_url,
+                "model": "nova-2-general",
+                "smart_format": True,
+                "punctuate": True
+            },
+            timeout=300,
+        )
+        r.raise_for_status()
+        data = r.json()
+        alt = data.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0]
+        text = alt.get("transcript", "").strip()
+        return text or None
+    except Exception:
+        return None
+
+def _transcribe_with_whisper(video_url: str, max_duration_sec: int = 7200) -> Optional[str]:
+    """
+    OpenAI Whisper fallback: download audio (webm/m4a/etc.) and transcribe.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="yt_audio_")
+    outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": False,
+        "extract_flat": False,
+        "format": "bestaudio/best",
+        "outtmpl": outtmpl,
+        "retries": 2,
+        "file_access_retries": 2,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
+    }
+    filepath = None
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+            dur = info.get("duration") or 0
+            if max_duration_sec and dur and dur > max_duration_sec:
+                return None
+            # locate the downloaded file
+            vid = info.get("id")
+            exts = ["webm", "m4a", "mp3", "opus", "aac"]
+            for ext in exts:
+                candidate = os.path.join(tmpdir, f"{vid}.{ext}")
+                if os.path.exists(candidate):
+                    filepath = candidate
+                    break
+        if not filepath:
+            return None
+
+        with open(filepath, "rb") as f:
+            tr = client.audio.transcriptions.create(model="whisper-1", file=f)
+            text = tr.text.strip() if hasattr(tr, "text") else (tr.get("text", "").strip() if isinstance(tr, dict) else "")
+            return text or None
+    except Exception:
+        return None
+    finally:
+        try:
+            # clean temp dir
+            for root, _, files in os.walk(tmpdir):
+                for fn in files:
+                    try:
+                        os.remove(os.path.join(root, fn))
+                    except Exception:
+                        pass
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
 
 
 # ----------------------- main index -----------------------
@@ -147,20 +236,28 @@ class VideoIndex:
     # ---------- Ingest one video ----------
     def add_video(self, url: str) -> int:
         """
-        Fetch transcript (Transcript API first, yt-dlp fallback), chunk, embed, and add to index.
+        Fetch transcript (Transcript API → yt-dlp captions → Deepgram → Whisper), chunk, embed, and add to index.
         Returns number of chunks added for this video.
         """
         vid = _extract_video_id(url)
 
-        # 1) Normal API path
+        # 1) Official transcript API
         full_text = _fetch_transcript_via_transcript_api(vid)
 
-        # 2) Fallback via yt-dlp subtitle URL (auto captions)
+        # 2) yt-dlp subtitle file (manual/auto captions)
         if not full_text:
             full_text = _fetch_transcript_via_ytdlp(url)
 
+        # 3) Deepgram by URL
         if not full_text:
-            print(f"[skip] No transcript available (API/yt-dlp) for {url}")
+            full_text = _transcribe_with_deepgram(url)
+
+        # 4) Whisper (download + transcribe)
+        if not full_text:
+            full_text = _transcribe_with_whisper(url)
+
+        if not full_text:
+            print(f"[skip] No transcript available for {url}")
             return 0
 
         # Simple chunking (character-based)
