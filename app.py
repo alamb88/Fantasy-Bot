@@ -2,17 +2,22 @@ import os
 import json
 import time
 import threading
-from typing import Set, Any, Dict, Optional
+from typing import Set, Any, Dict, Optional, List
 
 from fastapi import FastAPI, Query, Header, HTTPException, BackgroundTasks
-from fastapi.responses import PlainTextResponse, RedirectResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    PlainTextResponse,
+    RedirectResponse,
+    JSONResponse,
+    StreamingResponse,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
 
-# Import core index + helpers
+# ---- core index + helpers (your existing index.py / yahoo_integration.py) ----
 from index import (
     VideoIndex,
     answer,
@@ -27,7 +32,7 @@ from yahoo_integration import _load_oauth, save_token, get_game_id, snapshot_lea
 
 app = FastAPI(title="NBA Fantasy Bot (9-cat)")
 
-# ---- Env-driven CORS (best practice) ----
+# ---- Env-driven CORS (best practice for Lovable) ----
 # Set ALLOWED_ORIGINS in Railway, e.g.:
 # "https://*.lovable.dev,https://*.lovable.app,https://*.lovableproject.com"
 ALLOWED = os.getenv(
@@ -44,6 +49,12 @@ app.add_middleware(
     allow_headers=["Content-Type", "x-admin-token", "*"],
 )
 
+# Global OPTIONS responder (helps strict preflights)
+@app.options("/{path:path}")
+def options_handler():
+    return PlainTextResponse("", status_code=204)
+
+
 # ================= Config / Admin =================
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
@@ -56,7 +67,7 @@ def _require_admin(token_from_header: str):
 
 # ---------- YouTube helpers ----------
 
-def fetch_latest_youtube_items(channel: str, limit: int = 50) -> list[dict]:
+def fetch_latest_youtube_items(channel: str, limit: int = 50) -> List[dict]:
     """
     Return items: id,url,title,duration from a channel handle (@handle),
     playlist URL, or /videos URL.
@@ -75,7 +86,7 @@ def fetch_latest_youtube_items(channel: str, limit: int = 50) -> list[dict]:
         "geo_bypass": True,
         "http_headers": {"User-Agent": "Mozilla/5.0"},
     }
-    items: list[dict] = []
+    items: List[dict] = []
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(channel_url, download=False)
         for e in (info.get("entries") or []):
@@ -93,10 +104,10 @@ def fetch_latest_youtube_items(channel: str, limit: int = 50) -> list[dict]:
                 )
     return items
 
-def fetch_latest_youtube_urls(channel: str, limit: int = 12) -> list[str]:
+def fetch_latest_youtube_urls(channel: str, limit: int = 12) -> List[str]:
     return [it["url"] for it in fetch_latest_youtube_items(channel, limit)]
 
-def _passes_filters(item: dict, min_duration: int, include_kw: list[str], exclude_kw: list[str]) -> bool:
+def _passes_filters(item: dict, min_duration: int, include_kw: List[str], exclude_kw: List[str]) -> bool:
     title = (item.get("title") or "").lower()
     dur = item.get("duration") or 0
     if dur and dur < min_duration:
@@ -107,8 +118,7 @@ def _passes_filters(item: dict, min_duration: int, include_kw: list[str], exclud
         return False
     return True
 
-# --- Full channel/playlist traversal (large lists) ---
-def fetch_channel_items_all(channel: str, max_items: int = 5000) -> list[dict]:
+def fetch_channel_items_all(channel: str, max_items: int = 5000) -> List[dict]:
     """
     Traverse a channel/playlist and return up to max_items entries with id,title,duration,url.
     Using extract_flat lets yt-dlp fetch long playlists without downloading media.
@@ -120,7 +130,7 @@ def fetch_channel_items_all(channel: str, max_items: int = 5000) -> list[dict]:
         "quiet": True,
         "skip_download": True,
         "extract_flat": True,
-        "playlistend": max_items,    # cap to avoid endless crawl
+        "playlistend": max_items,
         "noplaylist": False,
         "retries": 3,
         "file_access_retries": 3,
@@ -128,7 +138,7 @@ def fetch_channel_items_all(channel: str, max_items: int = 5000) -> list[dict]:
         "geo_bypass": True,
         "http_headers": {"User-Agent": "Mozilla/5.0"},
     }
-    items: list[dict] = []
+    items: List[dict] = []
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(channel_url, download=False)
         for e in (info.get("entries") or []):
@@ -206,7 +216,7 @@ def health():
     return f"ok (index_loaded={index_loaded}, chunks={len(vi.meta)})"
 
 
-# --------- GET /ask (existing behavior) ---------
+# --------- GET /ask (legacy) ---------
 @app.get("/ask", response_class=PlainTextResponse)
 def ask_get(q: str = Query(..., description="Your question")):
     if vi.index is None or len(vi.meta) == 0:
@@ -239,7 +249,7 @@ def ask_post(payload: AskRequest):
     return answer(full_query, hits)
 
 
-# --------- (optional) streaming POST /ask_stream ---------
+# --------- SSE streaming: POST + GET fallbacks ---------
 
 def _build_context_snippets(hits):
     blocks = []
@@ -248,8 +258,12 @@ def _build_context_snippets(hits):
         blocks.append(f"[{i}] {short}\n(Source: {h.url})\n")
     return "\n".join(blocks)
 
+def _sse_wrap(text: str) -> str:
+    # SSE: each event line begins with "data:" and ends with a blank line
+    return f"data: {text}\n\n"
+
 @app.post("/ask_stream")
-def ask_stream(payload: AskRequest):
+def ask_stream_post(payload: AskRequest):
     if vi.index is None or len(vi.meta) == 0:
         return PlainTextResponse("Index not built yet.", status_code=400)
 
@@ -266,7 +280,7 @@ def ask_stream(payload: AskRequest):
     yahoo_ctx = _read_yahoo_context()
     user_content = f"{full_query}\n\n{yahoo_ctx}\n\nContext:\n{context_snippets}"
 
-    def token_generator():
+    def sse_gen():
         stream = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.2,
@@ -279,9 +293,50 @@ def ask_stream(payload: AskRequest):
         for chunk in stream:
             delta = getattr(chunk.choices[0].delta, "content", None) or ""
             if delta:
-                yield delta
+                yield _sse_wrap(delta)
 
-    return StreamingResponse(token_generator(), media_type="text/plain")
+    return StreamingResponse(
+        sse_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+@app.get("/ask_stream")
+def ask_stream_get(q: str = Query(..., description="Full query including any context")):
+    if vi.index is None or len(vi.meta) == 0:
+        return PlainTextResponse("Index not built yet.", status_code=400)
+
+    hits = vi.search(q, k=5)
+    context_snippets = _build_context_snippets(hits)
+    yahoo_ctx = _read_yahoo_context()
+    user_content = f"{q}\n\n{yahoo_ctx}\n\nContext:\n{context_snippets}"
+
+    def sse_gen():
+        stream = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            stream=True,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        for chunk in stream:
+            delta = getattr(chunk.choices[0].delta, "content", None) or ""
+            if delta:
+                yield _sse_wrap(delta)
+
+    return StreamingResponse(
+        sse_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # ================= Admin routes =================
@@ -491,7 +546,7 @@ def _progress_reset():
     _progress_save()
 
 def _ingest_channel_worker(channel: str, max_items: int, min_duration: int,
-                           include: list[str], exclude: list[str]):
+                           include: List[str], exclude: List[str]):
     global _ingest_running
     try:
         items = fetch_channel_items_all(channel, max_items=max_items)
