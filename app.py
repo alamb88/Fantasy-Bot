@@ -1,25 +1,28 @@
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://*.lovable.dev",   # Lovable preview
-        "https://*.lovable.app",   # Lovable prod (if applicable)
-        "https://your-custom-domain.com"  # add later if you have one
-    ],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
 import os
 from fastapi import FastAPI, Query, Header, HTTPException
 from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
 
 from index import VideoIndex, answer
 
+# 1) Create the app first
 app = FastAPI(title="NBA Fantasy Bot (9-cat)")
+
+# 2) Then add CORS (for Lovable UI)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://*.lovable.dev",
+        "https://*.lovable.app",
+        # add your own UI domain(s) here if needed:
+        # "https://your-domain.com",
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # ================= Config / Admin =================
 
@@ -125,6 +128,16 @@ def ask(q: str = Query(..., description="Your question")):
         return "Index not built yet. Use /admin/ingest_latest or /admin/ingest_filtered to build it."
     hits = vi.search(q, k=5)
     return answer(q, hits)
+
+# Optional POST variant if you prefer JSON body from Lovable
+# from pydantic import BaseModel
+# class AskBody(BaseModel): q: str
+# @app.post("/ask", response_class=PlainTextResponse)
+# def ask_post(body: AskBody):
+#     if vi.index is None or len(vi.meta) == 0:
+#         return "Index not built yet. Use /admin/ingest_filtered to build it."
+#     hits = vi.search(body.q, k=5)
+#     return answer(body.q, hits)
 
 # ================= Admin routes (no Shell needed) =================
 
@@ -253,23 +266,4 @@ def admin_diagnose_latest(
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(u, download=False)
                 has = bool((info.get("subtitles") or {}) or (info.get("automatic_captions") or {}))
-            except Exception:
-                has = False
-        lines.append(("✅" if has else "❌") + " " + u)
-        ok += 1 if has else 0
-
-    return f"Transcripts found (API or yt-dlp): {ok}/{len(urls)}\n" + "\n".join(lines)
-
-@app.post("/admin/ingest_one", response_class=PlainTextResponse)
-def admin_ingest_one(
-    x_admin_token: str = Header(default=""),
-    url: str = Query(..., description="Full YouTube watch URL"),
-):
-    _require_admin(x_admin_token)
-    try:
-        n = vi.add_video(url)
-        if n > 0:
-            vi.save()
-        return f"URL ingested. chunks_added={n}, total_chunks={len(vi.meta)}"
-    except Exception as e:
-        return f"Error: {repr(e)}"
+            except Exce
