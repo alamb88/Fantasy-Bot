@@ -2,6 +2,7 @@ import os
 from fastapi import FastAPI, Query, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 import yt_dlp
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
 
 from index import VideoIndex, answer
 
@@ -9,18 +10,17 @@ app = FastAPI(title="NBA Fantasy Bot (9-cat)")
 
 # ---- Init index (tolerate empty) ----
 vi = VideoIndex()
-INDEX_LOADED = False
 try:
-    INDEX_LOADED = vi.load()
+    vi.load()
 except Exception as e:
     print("Index load skipped:", repr(e))
-    INDEX_LOADED = False
 
-# ================= Public =================
+# ---------------- Public ----------------
 
 @app.get("/health", response_class=PlainTextResponse)
 def health():
-    return f"ok (index_loaded={INDEX_LOADED}, chunks={len(vi.meta)})"
+    index_loaded = (vi.index is not None and len(vi.meta) > 0)
+    return f"ok (index_loaded={index_loaded}, chunks={len(vi.meta)})"
 
 @app.get("/ask", response_class=PlainTextResponse)
 def ask(q: str = Query(..., description="Your question")):
@@ -29,7 +29,7 @@ def ask(q: str = Query(..., description="Your question")):
     hits = vi.search(q, k=5)
     return answer(q, hits)
 
-# ================= Admin (no Shell needed) =================
+# --------------- Admin (no Shell needed) ---------------
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 JOSH_URLS = os.getenv("JOSH_URLS", "")
@@ -39,7 +39,7 @@ def _require_admin(token_from_header: str):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 def fetch_latest_youtube_urls(channel: str, limit: int = 12) -> list[str]:
-    """Return latest video URLs from a channel/handle or channel URL."""
+    """Return latest video URLs from a @handle or full channel URL."""
     channel_url = f"https://www.youtube.com/{channel}/videos" if channel.startswith("@") else channel
     ydl_opts = {
         "quiet": True,
@@ -77,8 +77,6 @@ def admin_ingest(x_admin_token: str = Header(default="")):
 
     if added_chunks > 0:
         vi.save()
-        global INDEX_LOADED
-        INDEX_LOADED = True
 
     return f"Ingest complete. videos_added={added_videos}, chunks_added={added_chunks}, total_chunks={len(vi.meta)}"
 
@@ -106,17 +104,13 @@ def admin_ingest_latest(
 
     if added_chunks > 0:
         vi.save()
-        global INDEX_LOADED
-        INDEX_LOADED = True
 
     return (
         f"Ingest complete. videos_added={added_videos}, "
         f"chunks_added={added_chunks}, total_chunks={len(vi.meta)}"
     )
 
-# ---------- Diagnostics ----------
-
-from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+# ---------------- Diagnostics ----------------
 
 @app.get("/admin/diagnose_latest", response_class=PlainTextResponse)
 def admin_diagnose_latest(
@@ -162,8 +156,6 @@ def admin_ingest_one(
         n = vi.add_video(url)
         if n > 0:
             vi.save()
-            global INDEX_LOADED
-            INDEX_LOADED = True
         return f"URL ingested. chunks_added={n}, total_chunks={len(vi.meta)}"
     except Exception as e:
         return f"Error: {repr(e)}"
