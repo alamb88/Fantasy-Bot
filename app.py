@@ -2,26 +2,37 @@ import os
 import json
 import time
 import threading
-from typing import Set
+from typing import Set, Any, Dict, Optional
+
 from fastapi import FastAPI, Query, Header, HTTPException, BackgroundTasks
-from fastapi.responses import PlainTextResponse, RedirectResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
 
-from index import VideoIndex, answer
+# Import your core index + helpers
+from index import (
+    VideoIndex,
+    answer,
+    SYSTEM_PROMPT,
+    _read_yahoo_context,
+    client as openai_client,  # reuse your OpenAI client for streaming
+)
 from yahoo_integration import _load_oauth, save_token, get_game_id, snapshot_league
 
-# 1) Create the app
+
+# ================= FastAPI App =================
+
 app = FastAPI(title="NBA Fantasy Bot (9-cat)")
 
-# 2) CORS for Lovable/UI
+# CORS for Lovable/UI (add your own origin as needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://*.lovable.dev",
         "https://*.lovable.app",
-        # add your web UI domain(s) if you have one:
         # "https://your-domain.com",
     ],
     allow_credentials=True,
@@ -38,18 +49,27 @@ def _require_admin(token_from_header: str):
     if not ADMIN_TOKEN or token_from_header != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
 
+
 # ---------- YouTube helpers ----------
 
 def fetch_latest_youtube_items(channel: str, limit: int = 50) -> list[dict]:
     """
-    Return items: id,url,title,duration from a channel handle (@handle) or /videos URL.
+    Return items: id,url,title,duration from a channel handle (@handle),
+    playlist URL, or /videos URL.
     """
-    channel_url = f"https://www.youtube.com/{channel}/videos" if channel.startswith("@") else channel
+    channel_url = (
+        f"https://www.youtube.com/{channel}/videos" if channel.startswith("@") else channel
+    )
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
         "extract_flat": True,  # metadata only
         "playlistend": limit,
+        "retries": 3,
+        "file_access_retries": 3,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
     }
     items: list[dict] = []
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -59,12 +79,14 @@ def fetch_latest_youtube_items(channel: str, limit: int = 50) -> list[dict]:
             title = e.get("title") or ""
             duration = e.get("duration")
             if vid:
-                items.append({
-                    "id": vid,
-                    "url": f"https://www.youtube.com/watch?v={vid}",
-                    "title": title,
-                    "duration": duration if isinstance(duration, (int, float)) else None
-                })
+                items.append(
+                    {
+                        "id": vid,
+                        "url": f"https://www.youtube.com/watch?v={vid}",
+                        "title": title,
+                        "duration": duration if isinstance(duration, (int, float)) else None,
+                    }
+                )
     return items
 
 def fetch_latest_youtube_urls(channel: str, limit: int = 12) -> list[str]:
@@ -81,19 +103,26 @@ def _passes_filters(item: dict, min_duration: int, include_kw: list[str], exclud
         return False
     return True
 
-# --- Full channel traversal (large playlists) ---
+# --- Full channel/playlist traversal (large lists) ---
 def fetch_channel_items_all(channel: str, max_items: int = 5000) -> list[dict]:
     """
     Traverse a channel/playlist and return up to max_items entries with id,title,duration,url.
     Using extract_flat lets yt-dlp fetch long playlists without downloading media.
     """
-    channel_url = f"https://www.youtube.com/{channel}/videos" if channel.startswith("@") else channel
+    channel_url = (
+        f"https://www.youtube.com/{channel}/videos" if channel.startswith("@") else channel
+    )
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
         "extract_flat": True,
         "playlistend": max_items,    # cap to avoid endless crawl
         "noplaylist": False,
+        "retries": 3,
+        "file_access_retries": 3,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
     }
     items: list[dict] = []
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -103,13 +132,16 @@ def fetch_channel_items_all(channel: str, max_items: int = 5000) -> list[dict]:
             title = e.get("title") or ""
             duration = e.get("duration")
             if vid:
-                items.append({
-                    "id": vid,
-                    "url": f"https://www.youtube.com/watch?v={vid}",
-                    "title": title,
-                    "duration": duration if isinstance(duration, (int, float)) else None
-                })
+                items.append(
+                    {
+                        "id": vid,
+                        "url": f"https://www.youtube.com/watch?v={vid}",
+                        "title": title,
+                        "duration": duration if isinstance(duration, (int, float)) else None,
+                    }
+                )
     return items
+
 
 # ================= Index init =================
 
@@ -119,11 +151,10 @@ try:
 except Exception as e:
     print("Index load skipped:", repr(e))
 
-# de-dupe helper for full-channel ingest
 def _seen_ids_from_meta() -> Set[str]:
     return set(m.video_id for m in vi.meta)
 
-# ---- Auto-ingest on startup if index is empty (no Volumes) ----
+# ---- Auto-ingest on startup (optional) ----
 AUTO_INGEST = os.getenv("AUTO_INGEST", "0") == "1"
 AUTO_CHANNEL = os.getenv("AUTO_CHANNEL", "https://www.youtube.com/@LockedOnFantasyBasketball/videos")
 AUTO_LIMIT = int(os.getenv("AUTO_LIMIT", "20"))
@@ -153,7 +184,7 @@ try:
 except Exception as e:
     print("[auto-ingest] skipped due to error:", repr(e))
 
-# ---- Optional: auto-cache Yahoo on boot (after you auth once) ----
+# ---- Optional: auto-cache Yahoo on boot ----
 AUTO_YAHOO_LEAGUE_KEY = os.getenv("AUTO_YAHOO_LEAGUE_KEY", "")
 if AUTO_YAHOO_LEAGUE_KEY:
     try:
@@ -162,6 +193,7 @@ if AUTO_YAHOO_LEAGUE_KEY:
     except Exception as e:
         print("[auto] Yahoo cache failed:", repr(e))
 
+
 # ================= Public routes =================
 
 @app.get("/health", response_class=PlainTextResponse)
@@ -169,12 +201,88 @@ def health():
     index_loaded = (vi.index is not None and len(vi.meta) > 0)
     return f"ok (index_loaded={index_loaded}, chunks={len(vi.meta)})"
 
+
+# --------- GET /ask (existing behavior) ---------
 @app.get("/ask", response_class=PlainTextResponse)
-def ask(q: str = Query(..., description="Your question")):
+def ask_get(q: str = Query(..., description="Your question")):
     if vi.index is None or len(vi.meta) == 0:
         return "Index not built yet. Use /admin/ingest_latest or /admin/ingest_filtered to build it."
     hits = vi.search(q, k=5)
     return answer(q, hits)
+
+
+# --------- NEW: POST /ask (for Lovable chat) ---------
+
+class AskRequest(BaseModel):
+    message: str
+    draftContext: Optional[Dict[str, Any]] = None
+    k: int = 5  # how many context snippets to pull
+
+@app.post("/ask", response_class=PlainTextResponse)
+def ask_post(payload: AskRequest):
+    if vi.index is None or len(vi.meta) == 0:
+        return "Index not built yet. Use /admin/ingest_latest or /admin/ingest_filtered to build it."
+
+    # Flatten draft context (if provided) into a readable preface
+    ctx_lines = []
+    if payload.draftContext:
+        for key, val in payload.draftContext.items():
+            ctx_lines.append(f"- {key}: {val}")
+    ctx_block = "\n".join(ctx_lines)
+
+    # Compose the effective user query
+    full_query = f"{payload.message}\n\nDraft context:\n{ctx_block}" if ctx_block else payload.message
+
+    hits = vi.search(full_query, k=max(1, payload.k))
+    return answer(full_query, hits)
+
+
+# --------- NEW (optional): streaming POST /ask_stream ---------
+
+def _build_context_snippets(hits):
+    blocks = []
+    for i, h in enumerate(hits, start=1):
+        short = (h.text[:300] + "…") if len(h.text) > 300 else h.text
+        blocks.append(f"[{i}] {short}\n(Source: {h.url})\n")
+    return "\n".join(blocks)
+
+@app.post("/ask_stream")
+def ask_stream(payload: AskRequest):
+    if vi.index is None or len(vi.meta) == 0:
+        return PlainTextResponse("Index not built yet.", status_code=400)
+
+    # Flatten draft context
+    ctx_lines = []
+    if payload.draftContext:
+        for key, val in payload.draftContext.items():
+            ctx_lines.append(f"- {key}: {val}")
+    ctx_block = "\n".join(ctx_lines)
+    full_query = f"{payload.message}\n\nDraft context:\n{ctx_block}" if ctx_block else payload.message
+
+    hits = vi.search(full_query, k=max(1, payload.k))
+    context_snippets = _build_context_snippets(hits)
+
+    # Build the same prompt your /ask uses
+    yahoo_ctx = _read_yahoo_context()
+    user_content = f"{full_query}\n\n{yahoo_ctx}\n\nContext:\n{context_snippets}"
+
+    def token_generator():
+        stream = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            stream=True,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        for chunk in stream:
+            delta = getattr(chunk.choices[0].delta, "content", None) or ""
+            if delta:
+                yield delta
+
+    return StreamingResponse(token_generator(), media_type="text/plain")
+
 
 # ================= Admin routes (no Shell needed) =================
 
@@ -303,7 +411,7 @@ def admin_diagnose_latest(
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(u, download=False)
                 has = bool((info.get("subtitles") or {}) or (info.get("automatic_captions") or {}))
-            except Exception as e:
+            except Exception:
                 has = False
         lines.append(("✅" if has else "❌") + " " + u)
         ok += 1 if has else 0
@@ -324,9 +432,11 @@ def admin_ingest_one(
     except Exception as e:
         return f"Error: {repr(e)}"
 
-# ---------------- Full-Channel Ingest (Background) ----------------
+
+# ---------------- Full-Channel Ingest (Background) + Failure tracking ----------------
 
 PROGRESS_PATH = os.path.join("data", "ingest_progress.json")
+FAIL_PATH = os.path.join("data", "ingest_failures.json")
 _ingest_lock = threading.Lock()
 _ingest_running = False
 _progress = {
@@ -347,6 +457,21 @@ def _progress_save():
         os.makedirs("data", exist_ok=True)
         with open(PROGRESS_PATH, "w") as f:
             json.dump(_progress, f, indent=2)
+    except Exception:
+        pass
+
+def _fail_list_load() -> list:
+    try:
+        if os.path.exists(FAIL_PATH):
+            return json.load(open(FAIL_PATH))
+    except Exception:
+        pass
+    return []
+
+def _fail_list_save(lst: list):
+    try:
+        os.makedirs("data", exist_ok=True)
+        json.dump(lst, open(FAIL_PATH, "w"), indent=2)
     except Exception:
         pass
 
@@ -375,6 +500,8 @@ def _ingest_channel_worker(channel: str, max_items: int, min_duration: int,
         _progress_save()
 
         seen = _seen_ids_from_meta()
+        failures = _fail_list_load()
+
         for it in items:
             try:
                 _progress["last"] = it.get("url", "")
@@ -393,24 +520,28 @@ def _ingest_channel_worker(channel: str, max_items: int, min_duration: int,
                 if vid in seen:
                     _progress["skipped"] += 1; _progress_save(); continue
 
-                # Ingest
+                # Ingest (index.py handles transcript fallbacks)
                 added = vi.add_video(url)
                 if added > 0:
                     _progress["added_videos"] += 1
                     _progress["added_chunks"] += added
                     seen.add(vid)
-                    # periodic save
                     if (_progress["added_videos"] % 5) == 0:
                         vi.save()
                 else:
                     _progress["skipped"] += 1
+                    if url not in failures:
+                        failures.append(url)
+                        _fail_list_save(failures)
                 _progress_save()
 
             except Exception:
                 _progress["errors"] += 1
+                if it.get("url") and it["url"] not in failures:
+                    failures.append(it["url"])
+                    _fail_list_save(failures)
                 _progress_save()
 
-        # final save
         if vi.index is not None and len(vi.meta) > 0:
             vi.save()
 
@@ -432,10 +563,6 @@ def admin_ingest_channel_full(
     include: str = Query("tier,sleeper,bust,punt,rank,draft"),
     exclude: str = Query("short,stream,live,clip"),
 ):
-    """
-    Kick off a long-running, full-channel ingestion in the background.
-    Returns immediately; poll /admin/ingest_progress for status.
-    """
     _require_admin(x_admin_token)
 
     include_kw = [s.strip().lower() for s in include.split(",") if s.strip()]
@@ -454,7 +581,6 @@ def admin_ingest_channel_full(
 @app.get("/admin/ingest_progress")
 def admin_ingest_progress(x_admin_token: str = Header(default="")):
     _require_admin(x_admin_token)
-    # Try to return latest saved snapshot if present
     try:
         if os.path.exists(PROGRESS_PATH):
             return JSONResponse(json.load(open(PROGRESS_PATH)))
@@ -462,16 +588,54 @@ def admin_ingest_progress(x_admin_token: str = Header(default="")):
         pass
     return JSONResponse(_progress)
 
+# ---- Failures: see & retry ----
+
+@app.get("/admin/ingest_failures")
+def admin_ingest_failures(x_admin_token: str = Header(default="")):
+    _require_admin(x_admin_token)
+    return JSONResponse({"failures": _fail_list_load()})
+
+@app.post("/admin/retry_failures", response_class=PlainTextResponse)
+def admin_retry_failures(
+    x_admin_token: str = Header(default=""),
+    limit: int = Query(50, ge=1, le=1000)
+):
+    _require_admin(x_admin_token)
+    failures = _fail_list_load()
+    if not failures:
+        return "No failures recorded."
+
+    to_retry = failures[:limit]
+    still_failed = []
+    added_videos = 0
+    added_chunks = 0
+
+    for url in to_retry:
+        try:
+            n = vi.add_video(url)
+            if n > 0:
+                added_videos += 1
+                added_chunks += n
+            else:
+                still_failed.append(url)
+        except Exception:
+            still_failed.append(url)
+
+    remaining = still_failed + failures[len(to_retry):]
+    _fail_list_save(remaining)
+
+    if added_videos > 0:
+        vi.save()
+
+    return f"Retried {len(to_retry)}. Success: {added_videos} (chunks {added_chunks}). Remaining failures: {len(remaining)}"
+
+
 # ================= Yahoo Auth & Data =================
 
 @app.get("/auth/yahoo/login")
 def yahoo_login():
-    """
-    Starts Yahoo 3-legged OAuth: redirects user to Yahoo consent page.
-    """
     try:
         oauth = _load_oauth()
-        # If already valid, short-circuit
         if oauth.token and oauth.token_is_valid():
             return PlainTextResponse("Already authorized with Yahoo.")
         auth_url = oauth.generate_authorize_url()
@@ -481,9 +645,6 @@ def yahoo_login():
 
 @app.get("/auth/yahoo/callback")
 def yahoo_callback(code: str = "", state: str = ""):
-    """
-    Yahoo redirects here with ?code=...
-    """
     try:
         oauth = _load_oauth()
         if not code:
@@ -518,9 +679,6 @@ def yahoo_game_id():
 
 @app.get("/yahoo/cache")
 def yahoo_cache_read():
-    """
-    Return last cached snapshot (if any).
-    """
     p = os.path.join("data", "yahoo_cache.json")
     if not os.path.exists(p):
         return PlainTextResponse("No Yahoo cache yet. Run /auth/yahoo/login then /admin/yahoo/cache_league.", status_code=404)
