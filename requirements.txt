@@ -8,3 +8,4 @@ yt-dlp
 requests
 yahoo-fantasy-api
 yahoo-oauth
+deepgram-sdk
