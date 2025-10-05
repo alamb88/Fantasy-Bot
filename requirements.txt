@@ -6,3 +6,5 @@ faiss-cpu
 tiktoken
 yt-dlp
 requests
+yahoo-fantasy-api
+yahoo-oauth
