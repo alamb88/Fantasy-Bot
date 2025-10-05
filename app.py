@@ -29,32 +29,33 @@ from yahoo_integration import _load_oauth, save_token, get_game_id, snapshot_lea
 
 
 # ================= FastAPI App =================
-# ---- CORS Configuration ----
-# For development: allow all origins (simplest fix)
+
+app = FastAPI(title="NBA Fantasy Bot (9-cat)")
+
+# ---- CORS: Allow all origins for Lovable preview domains ----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
-    allow_credentials=False,  # Must be False when using "*"
+    allow_origins=["*"],  # Allow all origins (works with Lovable's dynamic preview URLs)
+    allow_credentials=False,  # Must be False when using allow_origins=["*"]
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],  # Allow all headers including Content-Type, Accept, x-admin-token
+    allow_headers=["*"],
     expose_headers=["*"],
 )
 
 # Global OPTIONS responder (helps strict preflights)
 @app.options("/{path:path}")
 def options_handler():
-    return PlainTextResponse("", status_code=204, headers={
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "*",
-    })
-
-
-# Global OPTIONS responder (helps strict preflights)
-@app.options("/{path:path}")
-def options_handler():
     return PlainTextResponse("", status_code=204)
 
+
+# ================= Config / Admin =================
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+JOSH_URLS = os.getenv("JOSH_URLS", "")
+
+def _require_admin(token_from_header: str):
+    if not ADMIN_TOKEN or token_from_header != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized")
 
 # ================= Config / Admin =================
 
