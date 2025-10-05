@@ -5,3 +5,4 @@ youtube-transcript-api
 faiss-cpu
 tiktoken
 yt-dlp
+requests
