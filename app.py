@@ -1,3 +1,16 @@
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://*.lovable.dev",   # Lovable preview
+        "https://*.lovable.app",   # Lovable prod (if applicable)
+        "https://your-custom-domain.com"  # add later if you have one
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 import os
 from fastapi import FastAPI, Query, Header, HTTPException
 from fastapi.responses import PlainTextResponse
