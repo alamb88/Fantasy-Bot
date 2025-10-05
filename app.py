@@ -12,13 +12,13 @@ from pydantic import BaseModel
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
 
-# Import your core index + helpers
+# Import core index + helpers
 from index import (
     VideoIndex,
     answer,
     SYSTEM_PROMPT,
     _read_yahoo_context,
-    client as openai_client,  # reuse your OpenAI client for streaming
+    client as openai_client,  # reuse OpenAI client for streaming
 )
 from yahoo_integration import _load_oauth, save_token, get_game_id, snapshot_league
 
@@ -27,17 +27,21 @@ from yahoo_integration import _load_oauth, save_token, get_game_id, snapshot_lea
 
 app = FastAPI(title="NBA Fantasy Bot (9-cat)")
 
-# CORS for Lovable/UI (add your own origin as needed)
+# ---- Env-driven CORS (best practice) ----
+# Set ALLOWED_ORIGINS in Railway, e.g.:
+# "https://*.lovable.dev,https://*.lovable.app,https://*.lovableproject.com"
+ALLOWED = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://*.lovable.dev,https://*.lovable.app,https://*.lovableproject.com",
+)
+allow_list = [o.strip() for o in ALLOWED.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://*.lovable.dev",
-        "https://*.lovable.app",
-        # "https://your-domain.com",
-    ],
-    allow_credentials=True,
+    allow_origins=allow_list,
+    allow_credentials=True,  # keep True if you may use cookies/auth later
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "x-admin-token", "*"],
 )
 
 # ================= Config / Admin =================
@@ -211,33 +215,31 @@ def ask_get(q: str = Query(..., description="Your question")):
     return answer(q, hits)
 
 
-# --------- NEW: POST /ask (for Lovable chat) ---------
+# --------- POST /ask (for Lovable chat) ---------
 
 class AskRequest(BaseModel):
     message: str
     draftContext: Optional[Dict[str, Any]] = None
-    k: int = 5  # how many context snippets to pull
+    k: int = 5  # number of context snippets
 
 @app.post("/ask", response_class=PlainTextResponse)
 def ask_post(payload: AskRequest):
     if vi.index is None or len(vi.meta) == 0:
         return "Index not built yet. Use /admin/ingest_latest or /admin/ingest_filtered to build it."
 
-    # Flatten draft context (if provided) into a readable preface
+    # Flatten draft context into a readable preface
     ctx_lines = []
     if payload.draftContext:
         for key, val in payload.draftContext.items():
             ctx_lines.append(f"- {key}: {val}")
     ctx_block = "\n".join(ctx_lines)
 
-    # Compose the effective user query
     full_query = f"{payload.message}\n\nDraft context:\n{ctx_block}" if ctx_block else payload.message
-
     hits = vi.search(full_query, k=max(1, payload.k))
     return answer(full_query, hits)
 
 
-# --------- NEW (optional): streaming POST /ask_stream ---------
+# --------- (optional) streaming POST /ask_stream ---------
 
 def _build_context_snippets(hits):
     blocks = []
@@ -261,8 +263,6 @@ def ask_stream(payload: AskRequest):
 
     hits = vi.search(full_query, k=max(1, payload.k))
     context_snippets = _build_context_snippets(hits)
-
-    # Build the same prompt your /ask uses
     yahoo_ctx = _read_yahoo_context()
     user_content = f"{full_query}\n\n{yahoo_ctx}\n\nContext:\n{context_snippets}"
 
@@ -284,7 +284,7 @@ def ask_stream(payload: AskRequest):
     return StreamingResponse(token_generator(), media_type="text/plain")
 
 
-# ================= Admin routes (no Shell needed) =================
+# ================= Admin routes =================
 
 @app.post("/admin/ingest", response_class=PlainTextResponse)
 def admin_ingest(x_admin_token: str = Header(default="")):
@@ -394,7 +394,6 @@ def admin_diagnose_latest(
     if not urls:
         return "No videos found."
 
-    # Quick probe using Transcript API; yt-dlp fallback presence check via metadata
     lines = []
     ok = 0
     for u in urls:
@@ -520,7 +519,7 @@ def _ingest_channel_worker(channel: str, max_items: int, min_duration: int,
                 if vid in seen:
                     _progress["skipped"] += 1; _progress_save(); continue
 
-                # Ingest (index.py handles transcript fallbacks)
+                # Ingest (index.py handles all transcript fallbacks)
                 added = vi.add_video(url)
                 if added > 0:
                     _progress["added_videos"] += 1
@@ -683,3 +682,4 @@ def yahoo_cache_read():
     if not os.path.exists(p):
         return PlainTextResponse("No Yahoo cache yet. Run /auth/yahoo/login then /admin/yahoo/cache_league.", status_code=404)
     return JSONResponse(json.load(open(p)))
+
