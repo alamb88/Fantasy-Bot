@@ -16,7 +16,6 @@ app.add_middleware(
     allow_origins=[
         "https://*.lovable.dev",
         "https://*.lovable.app",
-        # add your own UI domain(s) here if needed:
         # "https://your-domain.com",
     ],
     allow_credentials=True,
@@ -266,4 +265,23 @@ def admin_diagnose_latest(
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(u, download=False)
                 has = bool((info.get("subtitles") or {}) or (info.get("automatic_captions") or {}))
-            except Exce
+            except Exception as e:
+                has = False
+        lines.append(("✅" if has else "❌") + " " + u)
+        ok += 1 if has else 0
+
+    return f"Transcripts found (API or yt-dlp): {ok}/{len(urls)}\n" + "\n".join(lines)
+
+@app.post("/admin/ingest_one", response_class=PlainTextResponse)
+def admin_ingest_one(
+    x_admin_token: str = Header(default=""),
+    url: str = Query(..., description="Full YouTube watch URL"),
+):
+    _require_admin(x_admin_token)
+    try:
+        n = vi.add_video(url)
+        if n > 0:
+            vi.save()
+        return f"URL ingested. chunks_added={n}, total_chunks={len(vi.meta)}"
+    except Exception as e:
+        return f"Error: {repr(e)}"
