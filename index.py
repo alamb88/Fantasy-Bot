@@ -22,8 +22,9 @@ from youtube_transcript_api import (
 DATA_DIR = "data"
 META_PATH = os.path.join(DATA_DIR, "meta.json")
 FAISS_PATH = os.path.join(DATA_DIR, "index.faiss")
+YAHOO_CACHE = os.path.join(DATA_DIR, "yahoo_cache.json")
 
-client = OpenAI()
+client = OpenAI()  # Requires OPENAI_API_KEY env var
 enc = tiktoken.get_encoding("cl100k_base")
 
 
@@ -91,8 +92,7 @@ def _fetch_transcript_via_ytdlp(video_url: str) -> Optional[str]:
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
-        "extract_flat": False,  # we need full info (not flat playlist entries)
-        # do NOT write files; we’ll fetch the subtitle URL ourselves
+        "extract_flat": False,  # need full info
         "writesubtitles": False,
         "writeautomaticsub": False,
     }
@@ -102,7 +102,7 @@ def _fetch_transcript_via_ytdlp(video_url: str) -> Optional[str]:
     except Exception:
         return None
 
-    # Try manual subtitles first
+    # Try manual subtitles first, then auto
     sub_map = info.get("subtitles") or {}
     auto_map = info.get("automatic_captions") or {}
 
@@ -110,9 +110,7 @@ def _fetch_transcript_via_ytdlp(video_url: str) -> Optional[str]:
         # Prefer English keys; fall back to any
         for key in ["en", "en-US", "en-GB", "a.en", "en-uk", "en-us"]:
             if key in track_map and track_map[key]:
-                # track is list of formats, pick the first URL
                 return track_map[key][0].get("url")
-        # any language as last resort
         for _, lst in track_map.items():
             if lst and lst[0].get("url"):
                 return lst[0]["url"]
@@ -220,19 +218,35 @@ Base your answer on the provided snippets; be concise and practical.
 Cite numbered sources like [1], [2] with the video URLs.
 """
 
+def _read_yahoo_context() -> str:
+    try:
+        if os.path.exists(YAHOO_CACHE):
+            snap = json.load(open(YAHOO_CACHE, "r", encoding="utf-8"))
+            settings = snap.get("settings", {})
+            cats = [c.get("display_name") for c in settings.get("stat_categories", {}).get("stats", []) if c.get("display_name")]
+            roster_positions = [p.get("position") for p in settings.get("roster_positions", []) if p.get("position")]
+            return (
+                f"Yahoo league context: categories={', '.join(cats[:9]) or '(unknown)'}; "
+                f"roster positions={', '.join(roster_positions) or '(unknown)'}."
+            )
+    except Exception:
+        pass
+    return ""
+
 def answer(query: str, hits: List[Chunk]) -> str:
     context = ""
     for i, h in enumerate(hits, start=1):
         short = (h.text[:300] + "…") if len(h.text) > 300 else h.text
         context += f"[{i}] {short}\n(Source: {h.url})\n\n"
 
+    yahoo_ctx = _read_yahoo_context()
+
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.2,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"{query}\n\nContext:\n{context}"},
+            {"role": "user", "content": f"{query}\n\n{yahoo_ctx}\n\nContext:\n{context}"},
         ],
     )
     return resp.choices[0].message.content
-
