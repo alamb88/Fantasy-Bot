@@ -10,7 +10,7 @@ from openai import OpenAI
 from urllib.parse import urlparse, parse_qs
 from youtube_transcript_api import YouTubeTranscriptApi
 
-# ----- Config (keep simple for MVP) -----
+# ----- Paths -----
 DATA_DIR = "data"
 META_PATH = os.path.join(DATA_DIR, "meta.json")
 FAISS_PATH = os.path.join(DATA_DIR, "index.faiss")
@@ -51,7 +51,7 @@ class VideoIndex:
         srt = YouTubeTranscriptApi.get_transcript(vid)
         full_text = " ".join([x["text"] for x in srt if x.get("text")])
 
-        # naive chunking (token-aware optional later)
+        # Simple character-based chunking (you can switch to token-aware later)
         chunk_size = 1500
         chunks = [full_text[i:i + chunk_size] for i in range(0, len(full_text), chunk_size)]
         if not chunks:
@@ -127,7 +127,7 @@ def answer(query: str, hits: List[Chunk]) -> str:
     return resp.choices[0].message.content
 
 
-# Optional CLI for manual ingest & ask (useful in Railway Shell)
+# Optional CLI for Railway Shell usage (not required if you use admin endpoints)
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
@@ -147,6 +147,10 @@ if __name__ == "__main__":
 
     if args.save:
         vi.save()
+
+    if args.ask:
+        hits = vi.search(args.ask, k=5)
+        print(answer(args.ask, hits))
 
     if args.ask:
         hits = vi.search(args.ask, k=5)
