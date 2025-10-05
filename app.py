@@ -29,25 +29,26 @@ from yahoo_integration import _load_oauth, save_token, get_game_id, snapshot_lea
 
 
 # ================= FastAPI App =================
-
-app = FastAPI(title="NBA Fantasy Bot (9-cat)")
-
-# ---- Env-driven CORS (best practice for Lovable) ----
-# Set ALLOWED_ORIGINS in Railway, e.g.:
-# "https://*.lovable.dev,https://*.lovable.app,https://*.lovableproject.com"
-ALLOWED = os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://*.lovable.dev,https://*.lovable.app,https://*.lovableproject.com",
-)
-allow_list = [o.strip() for o in ALLOWED.split(",") if o.strip()]
-
+# ---- CORS Configuration ----
+# For development: allow all origins (simplest fix)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_list,
-    allow_credentials=True,  # keep True if you may use cookies/auth later
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=False,  # Must be False when using "*"
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "x-admin-token", "*"],
+    allow_headers=["*"],  # Allow all headers including Content-Type, Accept, x-admin-token
+    expose_headers=["*"],
 )
+
+# Global OPTIONS responder (helps strict preflights)
+@app.options("/{path:path}")
+def options_handler():
+    return PlainTextResponse("", status_code=204, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    })
+
 
 # Global OPTIONS responder (helps strict preflights)
 @app.options("/{path:path}")
