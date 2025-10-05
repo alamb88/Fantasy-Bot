@@ -8,28 +8,7 @@ from index import VideoIndex, answer
 
 app = FastAPI(title="NBA Fantasy Bot (9-cat)")
 
-# ---- Init index (tolerate empty) ----
-vi = VideoIndex()
-try:
-    vi.load()
-except Exception as e:
-    print("Index load skipped:", repr(e))
-
-# ================= Public =================
-
-@app.get("/health", response_class=PlainTextResponse)
-def health():
-    index_loaded = (vi.index is not None and len(vi.meta) > 0)
-    return f"ok (index_loaded={index_loaded}, chunks={len(vi.meta)})"
-
-@app.get("/ask", response_class=PlainTextResponse)
-def ask(q: str = Query(..., description="Your question")):
-    if vi.index is None or len(vi.meta) == 0:
-        return "Index not built yet. Use /admin/ingest_latest or /admin/ingest_filtered to build it."
-    hits = vi.search(q, k=5)
-    return answer(q, hits)
-
-# ================= Admin (no Shell needed) =================
+# ================= Config / Admin =================
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 JOSH_URLS = os.getenv("JOSH_URLS", "")
@@ -38,13 +17,18 @@ def _require_admin(token_from_header: str):
     if not ADMIN_TOKEN or token_from_header != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="unauthorized")
 
+# ---------- YouTube helpers ----------
+
 def fetch_latest_youtube_items(channel: str, limit: int = 50) -> list[dict]:
-    """Return items: id,url,title,duration from a channel handle or /videos URL."""
+    """
+    Return items: id,url,title,duration from a channel handle (@handle) or /videos URL.
+    We use yt-dlp metadata extraction (no downloads).
+    """
     channel_url = f"https://www.youtube.com/{channel}/videos" if channel.startswith("@") else channel
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
-        "extract_flat": True,   # metadata only
+        "extract_flat": True,  # metadata only
         "playlistend": limit,
     }
     items: list[dict] = []
@@ -76,6 +60,60 @@ def _passes_filters(item: dict, min_duration: int, include_kw: list[str], exclud
     if exclude_kw and any(kw in title for kw in exclude_kw):
         return False
     return True
+
+# ================= Index init =================
+
+vi = VideoIndex()
+try:
+    vi.load()
+except Exception as e:
+    print("Index load skipped:", repr(e))
+
+# ---- Auto-ingest on startup if index is empty (for setups without Volumes) ----
+AUTO_INGEST = os.getenv("AUTO_INGEST", "0") == "1"
+AUTO_CHANNEL = os.getenv("AUTO_CHANNEL", "https://www.youtube.com/@LockedOnFantasyBasketball/videos")
+AUTO_LIMIT = int(os.getenv("AUTO_LIMIT", "20"))
+AUTO_FILTERED = os.getenv("AUTO_FILTERED", "1") == "1"
+AUTO_MIN_DURATION = int(os.getenv("AUTO_MIN_DURATION", "600"))  # seconds
+AUTO_INCLUDE = os.getenv("AUTO_INCLUDE", "tier,sleeper,bust,punt,rank,draft")
+AUTO_EXCLUDE = os.getenv("AUTO_EXCLUDE", "short,stream,live,clip")
+
+try:
+    needs_build = (vi.index is None or len(vi.meta) == 0)
+    if needs_build and AUTO_INGEST:
+        if AUTO_FILTERED:
+            items = fetch_latest_youtube_items(AUTO_CHANNEL, limit=AUTO_LIMIT)
+            include_kw = [s.strip().lower() for s in AUTO_INCLUDE.split(",") if s.strip()]
+            exclude_kw = [s.strip().lower() for s in AUTO_EXCLUDE.split(",") if s.strip()]
+            for it in items:
+                if _passes_filters(it, AUTO_MIN_DURATION, include_kw, exclude_kw):
+                    vi.add_video(it["url"])
+        else:
+            for url in fetch_latest_youtube_urls(AUTO_CHANNEL, limit=AUTO_LIMIT):
+                vi.add_video(url)
+        if vi.index is not None and len(vi.meta) > 0:
+            vi.save()
+            print(f"[auto-ingest] Built index with {len(vi.meta)} chunks.")
+        else:
+            print("[auto-ingest] No items ingested on startup.")
+except Exception as e:
+    print("[auto-ingest] skipped due to error:", repr(e))
+
+# ================= Public routes =================
+
+@app.get("/health", response_class=PlainTextResponse)
+def health():
+    index_loaded = (vi.index is not None and len(vi.meta) > 0)
+    return f"ok (index_loaded={index_loaded}, chunks={len(vi.meta)})"
+
+@app.get("/ask", response_class=PlainTextResponse)
+def ask(q: str = Query(..., description="Your question")):
+    if vi.index is None or len(vi.meta) == 0:
+        return "Index not built yet. Use /admin/ingest_latest or /admin/ingest_filtered to build it."
+    hits = vi.search(q, k=5)
+    return answer(q, hits)
+
+# ================= Admin routes (no Shell needed) =================
 
 @app.post("/admin/ingest", response_class=PlainTextResponse)
 def admin_ingest(x_admin_token: str = Header(default="")):
@@ -184,7 +222,8 @@ def admin_diagnose_latest(
     urls = fetch_latest_youtube_urls(channel, limit=limit)
     if not urls:
         return "No videos found."
-    # Quick probe using Transcript API; yt-dlp fallback requires full extraction per URL (slower)
+
+    # Quick probe using Transcript API; yt-dlp fallback presence check via metadata
     lines = []
     ok = 0
     for u in urls:
@@ -196,7 +235,6 @@ def admin_diagnose_latest(
         except (NoTranscriptFound, TranscriptsDisabled, Exception):
             has = False
         if not has:
-            # Try detecting presence via yt-dlp metadata quickly
             try:
                 ydl_opts = {"quiet": True, "skip_download": True, "extract_flat": False}
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -222,9 +260,3 @@ def admin_ingest_one(
         return f"URL ingested. chunks_added={n}, total_chunks={len(vi.meta)}"
     except Exception as e:
         return f"Error: {repr(e)}"
-
-
-    global INDEX_LOADED
-    INDEX_LOADED = True
-    return f"Ingest complete. Added {len(urls)} videos from {channel}."
-
