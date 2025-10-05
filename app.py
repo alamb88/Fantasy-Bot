@@ -1,21 +1,23 @@
 import os
 from fastapi import FastAPI, Query, Header, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
 
 from index import VideoIndex, answer
+from yahoo_integration import _load_oauth, save_token, get_game_id, snapshot_league
 
-# 1) Create the app first
+# 1) Create the app
 app = FastAPI(title="NBA Fantasy Bot (9-cat)")
 
-# 2) Then add CORS (for Lovable UI)
+# 2) CORS for Lovable/UI
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://*.lovable.dev",
         "https://*.lovable.app",
+        # add your web UI domain(s) if you have one:
         # "https://your-domain.com",
     ],
     allow_credentials=True,
@@ -37,7 +39,6 @@ def _require_admin(token_from_header: str):
 def fetch_latest_youtube_items(channel: str, limit: int = 50) -> list[dict]:
     """
     Return items: id,url,title,duration from a channel handle (@handle) or /videos URL.
-    We use yt-dlp metadata extraction (no downloads).
     """
     channel_url = f"https://www.youtube.com/{channel}/videos" if channel.startswith("@") else channel
     ydl_opts = {
@@ -84,7 +85,7 @@ try:
 except Exception as e:
     print("Index load skipped:", repr(e))
 
-# ---- Auto-ingest on startup if index is empty (for setups without Volumes) ----
+# ---- Auto-ingest on startup if index is empty (no Volumes) ----
 AUTO_INGEST = os.getenv("AUTO_INGEST", "0") == "1"
 AUTO_CHANNEL = os.getenv("AUTO_CHANNEL", "https://www.youtube.com/@LockedOnFantasyBasketball/videos")
 AUTO_LIMIT = int(os.getenv("AUTO_LIMIT", "20"))
@@ -114,6 +115,15 @@ try:
 except Exception as e:
     print("[auto-ingest] skipped due to error:", repr(e))
 
+# ---- Optional: auto-cache Yahoo on boot (after you auth once) ----
+AUTO_YAHOO_LEAGUE_KEY = os.getenv("AUTO_YAHOO_LEAGUE_KEY", "")
+if AUTO_YAHOO_LEAGUE_KEY:
+    try:
+        snapshot_league(AUTO_YAHOO_LEAGUE_KEY)
+        print("[auto] Yahoo league cached.")
+    except Exception as e:
+        print("[auto] Yahoo cache failed:", repr(e))
+
 # ================= Public routes =================
 
 @app.get("/health", response_class=PlainTextResponse)
@@ -127,16 +137,6 @@ def ask(q: str = Query(..., description="Your question")):
         return "Index not built yet. Use /admin/ingest_latest or /admin/ingest_filtered to build it."
     hits = vi.search(q, k=5)
     return answer(q, hits)
-
-# Optional POST variant if you prefer JSON body from Lovable
-# from pydantic import BaseModel
-# class AskBody(BaseModel): q: str
-# @app.post("/ask", response_class=PlainTextResponse)
-# def ask_post(body: AskBody):
-#     if vi.index is None or len(vi.meta) == 0:
-#         return "Index not built yet. Use /admin/ingest_filtered to build it."
-#     hits = vi.search(body.q, k=5)
-#     return answer(body.q, hits)
 
 # ================= Admin routes (no Shell needed) =================
 
@@ -285,3 +285,68 @@ def admin_ingest_one(
         return f"URL ingested. chunks_added={n}, total_chunks={len(vi.meta)}"
     except Exception as e:
         return f"Error: {repr(e)}"
+
+# ================= Yahoo Auth & Data =================
+
+@app.get("/auth/yahoo/login")
+def yahoo_login():
+    """
+    Starts Yahoo 3-legged OAuth: redirects user to Yahoo consent page.
+    """
+    try:
+        oauth = _load_oauth()
+        # If already valid, short-circuit
+        if oauth.token and oauth.token_is_valid():
+            return PlainTextResponse("Already authorized with Yahoo.")
+        auth_url = oauth.generate_authorize_url()
+        return RedirectResponse(url=auth_url)
+    except Exception as e:
+        return PlainTextResponse(f"Error generating Yahoo login: {e}", status_code=500)
+
+@app.get("/auth/yahoo/callback")
+def yahoo_callback(code: str = "", state: str = ""):
+    """
+    Yahoo redirects here with ?code=...
+    """
+    try:
+        oauth = _load_oauth()
+        if not code:
+            return PlainTextResponse("Missing 'code' in callback.", status_code=400)
+        if not oauth.request_token(code):
+            return PlainTextResponse("Failed to exchange code for token.", status_code=401)
+        save_token(oauth)
+        return PlainTextResponse("Yahoo authorized! You can close this tab.")
+    except Exception as e:
+        return PlainTextResponse(f"Callback error: {e}", status_code=500)
+
+@app.post("/admin/yahoo/cache_league")
+def yahoo_cache_league(
+    x_admin_token: str = Header(default=""),
+    league_key: str = Query(..., description="Format: {game_id}.l.{league_id} (e.g., 423.l.12345)"),
+):
+    _require_admin(x_admin_token)
+    try:
+        snap = snapshot_league(league_key)
+        return JSONResponse(snap)
+    except Exception as e:
+        return PlainTextResponse(f"Yahoo snapshot error: {e}", status_code=500)
+
+@app.get("/yahoo/game_id")
+def yahoo_game_id():
+    try:
+        oauth = _load_oauth()
+        gid = get_game_id(oauth, "nba")
+        return PlainTextResponse(str(gid))
+    except Exception as e:
+        return PlainTextResponse(f"Error: {e}", status_code=500)
+
+@app.get("/yahoo/cache")
+def yahoo_cache_read():
+    """
+    Return last cached snapshot (if any).
+    """
+    p = os.path.join("data", "yahoo_cache.json")
+    if not os.path.exists(p):
+        return PlainTextResponse("No Yahoo cache yet. Run /auth/yahoo/login then /admin/yahoo/cache_league.", status_code=404)
+    import json
+    return JSONResponse(json.load(open(p)))
