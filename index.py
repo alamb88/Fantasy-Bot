@@ -8,14 +8,17 @@ import numpy as np
 import tiktoken
 from openai import OpenAI
 from urllib.parse import urlparse, parse_qs
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    NoTranscriptFound,
+    TranscriptsDisabled,
+)
 
 # ----- Paths -----
 DATA_DIR = "data"
 META_PATH = os.path.join(DATA_DIR, "meta.json")
 FAISS_PATH = os.path.join(DATA_DIR, "index.faiss")
 
-# OpenAI client (reads OPENAI_API_KEY from env)
 client = OpenAI()
 enc = tiktoken.get_encoding("cl100k_base")
 
@@ -35,32 +38,52 @@ class VideoIndex:
 
     # ---------- Embedding ----------
     def _embed(self, texts: List[str]) -> np.ndarray:
-        """Return L2-normalized embeddings for cosine/IP search."""
-        res = client.embeddings.create(
-            model="text-embedding-3-large",
-            input=texts
-        )
+        res = client.embeddings.create(model="text-embedding-3-large", input=texts)
         X = np.array([d.embedding for d in res.data], dtype="float32")
         X /= np.linalg.norm(X, axis=1, keepdims=True)
         return X
 
-    # ---------- Ingest ----------
-    def add_video(self, url: str):
-        """Fetch transcript, chunk, embed, and add to index."""
+    # ---------- Ingest one video ----------
+    def add_video(self, url: str) -> int:
+        """
+        Fetch transcript (manual or auto), chunk, embed, and add to index.
+        Returns number of chunks added for this video.
+        """
         vid = parse_qs(urlparse(url).query).get("v", [url.split("/")[-1]])[0]
-        srt = YouTubeTranscriptApi.get_transcript(vid)
-        full_text = " ".join([x["text"] for x in srt if x.get("text")])
 
-        # Simple character-based chunking (you can switch to token-aware later)
+        # Try manual English transcript first
+        srt = None
+        try:
+            srt = YouTubeTranscriptApi.get_transcript(vid, languages=["en", "en-US", "en-GB"])
+        except (NoTranscriptFound, TranscriptsDisabled):
+            srt = None
+
+        # Fallback: auto-generated English transcript
+        if srt is None:
+            try:
+                transcripts = YouTubeTranscriptApi.list_transcripts(vid)
+                gen = transcripts.find_generated_transcript(["en", "en-US", "en-GB"])
+                srt = gen.fetch()
+            except Exception:
+                srt = None
+
+        if not srt:
+            print(f"[skip] No transcript available for {url}")
+            return 0
+
+        full_text = " ".join([x.get("text", "") for x in srt if x.get("text")]).strip()
+        if not full_text:
+            print(f"[skip] Empty transcript for {url}")
+            return 0
+
+        # Simple chunking by characters (safe & fast)
         chunk_size = 1500
         chunks = [full_text[i:i + chunk_size] for i in range(0, len(full_text), chunk_size)]
         if not chunks:
-            print(f"No transcript text for {url}")
-            return
+            print(f"[skip] No chunks produced for {url}")
+            return 0
 
         vecs = self._embed(chunks)
-
-        # Create FAISS index if needed
         if self.index is None:
             self.index = faiss.IndexFlatIP(vecs.shape[1])
 
@@ -68,38 +91,36 @@ class VideoIndex:
         for c in chunks:
             self.meta.append(Chunk(video_id=vid, url=url, text=c))
 
-        print(f"Added {len(chunks)} chunks from {url}")
+        print(f"[ok] {len(chunks)} chunks added from {url}")
+        return len(chunks)
 
     # ---------- Persistence ----------
     def save(self):
         if self.index is None:
-            print("Nothing to save (index is empty).")
+            print("Nothing to save (index empty).")
             return
         faiss.write_index(self.index, FAISS_PATH)
         with open(META_PATH, "w", encoding="utf-8") as f:
             json.dump([asdict(m) for m in self.meta], f, ensure_ascii=False, indent=2)
-        print("Index saved.")
+        print("[ok] Index saved.")
 
     def load(self) -> bool:
-        """Load index & meta if present. Returns True if loaded, False otherwise."""
         if not (os.path.exists(FAISS_PATH) and os.path.exists(META_PATH)):
-            # Start empty; caller can ingest later.
             self.index = None
             self.meta = []
             print("No existing index yet (will build after ingest).")
             return False
-
         self.index = faiss.read_index(FAISS_PATH)
         with open(META_PATH, "r", encoding="utf-8") as f:
             meta_list = json.load(f)
         self.meta = [Chunk(**m) for m in meta_list]
-        print(f"Loaded {len(self.meta)} chunks from disk.")
+        print(f"[ok] Loaded {len(self.meta)} chunks from disk.")
         return True
 
     # ---------- Query ----------
     def search(self, query: str, k: int = 5) -> List[Chunk]:
         if self.index is None:
-            raise RuntimeError("Index is empty. Ingest videos first.")
+            raise RuntimeError("Index empty. Ingest videos first.")
         qv = self._embed([query])
         D, I = self.index.search(qv, min(k, len(self.meta)))
         return [self.meta[i] for i in I[0] if i != -1]
@@ -121,38 +142,7 @@ def answer(query: str, hits: List[Chunk]) -> str:
         temperature=0.2,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"{query}\n\nContext:\n{context}"}
-        ]
+            {"role": "user", "content": f"{query}\n\nContext:\n{context}"},
+        ],
     )
     return resp.choices[0].message.content
-
-
-# Optional CLI for Railway Shell usage (not required if you use admin endpoints)
-if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--add", nargs="+", help="YouTube URLs to add")
-    p.add_argument("--save", action="store_true")
-    p.add_argument("--load", action="store_true")
-    p.add_argument("--ask", type=str)
-    args = p.parse_args()
-
-    vi = VideoIndex()
-    if args.load:
-        vi.load()
-
-    if args.add:
-        for u in args.add:
-            vi.add_video(u)
-
-    if args.save:
-        vi.save()
-
-    if args.ask:
-        hits = vi.search(args.ask, k=5)
-        print(answer(args.ask, hits))
-
-    if args.ask:
-        hits = vi.search(args.ask, k=5)
-        print(answer(args.ask, hits))
-
